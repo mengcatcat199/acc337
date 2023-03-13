@@ -1,0 +1,2174 @@
+from __future__ import annotations
+import math
+import pickle
+import tkinter as tk
+import threading
+import inspect
+import ctypes
+import docx
+from playwright.sync_api import Playwright, sync_playwright
+import numpy as np
+import random
+import re
+import openai
+import csv
+from docx import Document
+from docx.oxml.ns import qn
+from docx.shared import Pt, RGBColor
+import base64
+import json
+import logging
+import os
+import os.path as osp
+import time
+import uuid
+from functools import wraps
+from os import environ
+from os import getenv
+import requests
+from httpx import AsyncClient
+from OpenAIAuth import Authenticator
+from OpenAIAuth import Error as AuthError
+from prompt_toolkit import prompt, PromptSession
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+
+
+def create_session():
+    session = PromptSession(history=InMemoryHistory())
+    return session
+
+
+def get_input(prompt_prefix, session=None):
+    """
+    Multiline input function.
+    """
+    prefix = prompt_prefix + "(Press Esc followed by Enter to finish)\n"
+    if session:
+        user_input = session.prompt(
+            prefix, multiline=True, auto_suggest=AutoSuggestFromHistory()
+        )
+    else:
+        user_input = prompt(prefix, multiline=True)
+
+    return user_input
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s",
+)
+
+log = logging.getLogger(__name__)
+
+
+def logger(is_timed: bool):
+    """Logger decorator
+
+    Args:
+        is_timed (bool): Whether to include function running time in exit log
+
+    Returns:
+        _type_: decorated function
+    """
+
+    def decorator(func):
+        wraps(func)
+
+        def wrapper(*args, **kwargs):
+            log.debug(
+                "Entering %s with args %s and kwargs %s",
+                func.__name__,
+                args,
+                kwargs,
+            )
+            start = time.time()
+            out = func(*args, **kwargs)
+            end = time.time()
+            if is_timed:
+                log.debug(
+                    "Exiting %s with return value %s. Took %s seconds.",
+                    func.__name__,
+                    out,
+                    end - start,
+                )
+            else:
+                log.debug("Exiting %s with return value %s", func.__name__, out)
+
+            return out
+
+        return wrapper
+
+    return decorator
+
+
+BASE_URL = environ.get("CHATGPT_BASE_URL") or "https://chatgpt.duti.tech/"
+
+
+class Error(Exception):
+    """
+    Base class for exceptions in this module.
+    Error codes:
+    -1: User error
+    0: Unknown error
+    1: Server error
+    2: Rate limit error
+    3: Invalid request error
+    4: Expired access token error
+    5: Invalid access token error
+    """
+
+    source: str
+    message: str
+    code: int
+
+    def __init__(self, source: str, message: str, code: int = 0):
+        self.source = source
+        self.message = message
+        self.code = code
+        # Code
+
+
+class Chatbot:
+    """
+    Chatbot class for ChatGPT
+    """
+
+    @logger(is_timed=True)
+    def __init__(
+        self,
+        config: dict[str, str],
+        conversation_id: str | None = None,
+        parent_id: str | None = None,
+        session_client=None,
+        lazy_loading: bool = False,
+    ) -> None:
+        """Initialize a chatbot
+
+        Args:
+            config (dict[str, str]): Login and proxy info. Example:
+                {
+                    "email": "OpenAI account email",
+                    "password": "OpenAI account password",
+                    "session_token": "<session_token>"
+                    "access_token": "<access_token>"
+                    "proxy": "<proxy_url_string>",
+                    "paid": True/False, # whether this is a plus account
+                }
+                More details on these are available at https://github.com/acheong08/ChatGPT#configuration
+            conversation_id (str | None, optional): Id of the conversation to continue on. Defaults to None.
+            parent_id (str | None, optional): Id of the previous response message to continue on. Defaults to None.
+            session_client (_type_, optional): _description_. Defaults to None.
+
+        Raises:
+            Exception: _description_
+        """
+        user_home = getenv("HOME")
+        # if user_home is None:
+        self.cache_path = "账号数据/chatzh1.json"
+        # else:
+        #     # mkdir ~/.config/revChatGPT
+        #     if not osp.exists(osp.join(user_home, ".config")):
+        #         os.mkdir(osp.join(user_home, ".config"))
+        #     if not osp.exists(osp.join(user_home, ".config", "revChatGPT")):
+        #         os.mkdir(osp.join(user_home, ".config", "revChatGPT"))
+        #     self.cache_path = osp.join(user_home, ".config", "revChatGPT", "cache.json")
+
+        self.config = config
+        self.session = session_client() if session_client else requests.Session()
+        try:
+            cached_access_token = self.__get_cached_access_token(
+                self.config.get("email", None),
+            )
+        except Error as error:
+            if error.code == 5:
+                raise error
+            cached_access_token = None
+        if cached_access_token is not None:
+            self.config["access_token"] = cached_access_token
+
+        if "proxy" in config:
+            if not isinstance(config["proxy"], str):
+                raise Exception("Proxy must be a string!")
+            proxies = {
+                "http": config["proxy"],
+                "https": config["proxy"],
+            }
+            if isinstance(self.session, AsyncClient):
+                self.session = AsyncClient(proxies=proxies)
+            else:
+                self.session.proxies.update(proxies)
+        self.conversation_id = conversation_id
+        self.parent_id = parent_id
+        self.conversation_mapping = {}
+        self.conversation_id_prev_queue = []
+        self.parent_id_prev_queue = []
+        self.lazy_loading = lazy_loading
+
+        self.__check_credentials()
+
+    @logger(is_timed=True)
+    def __check_credentials(self):
+        """Check login info and perform login
+
+        Any one of the following is sufficient for login. Multiple login info can be provided at the same time and they will be used in the order listed below.
+            - access_token
+            - session_token
+            - email + password
+
+        Raises:
+            Exception: _description_
+            AuthError: _description_
+        """
+        if "access_token" in self.config:
+            self.__set_access_token(self.config["access_token"])
+        elif "session_token" in self.config:
+            pass
+        elif "email" in self.config and "password" in self.config:
+            pass
+        else:
+            raise Exception("Insufficient login details provided!")
+        if "access_token" not in self.config:
+            try:
+                self.__login()
+            except AuthError as error:
+                raise error
+
+    @logger(is_timed=False)
+    def __set_access_token(self, access_token: str):
+        """Set access token in request header and self.config, then cache it to file.
+
+        Args:
+            access_token (str): access_token
+        """
+        self.session.headers.clear()
+        self.session.headers.update(
+            {
+                "Accept": "text/event-stream",
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "X-Openai-Assistant-App-Id": "",
+                "Connection": "close",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://chat.openai.com/chat",
+            },
+        )
+
+        self.config["access_token"] = access_token
+
+        email = self.config.get("email", None)
+        if email is not None:
+            self.__cache_access_token(email, access_token)
+
+    @logger(is_timed=False)
+    def __get_cached_access_token(self, email: str | None) -> str | None:
+        """Read access token from cache
+
+        Args:
+            email (str | None): email of the account to get access token
+
+        Raises:
+            Error: _description_
+            Error: _description_
+            Error: _description_
+
+        Returns:
+            str | None: access token string or None if not found
+        """
+        email = email or "default"
+        cache = self.__read_cache()
+        access_token = cache.get("access_tokens", {}).get(email, None)
+
+        # Parse access_token as JWT
+        if access_token is not None:
+            try:
+                # Split access_token into 3 parts
+                s_access_token = access_token.split(".")
+                # Add padding to the middle part
+                s_access_token[1] += "=" * ((4 - len(s_access_token[1]) % 4) % 4)
+                d_access_token = base64.b64decode(s_access_token[1])
+                d_access_token = json.loads(d_access_token)
+            except base64.binascii.Error:
+                raise Error(
+                    source="__get_cached_access_token",
+                    message="Invalid access token",
+                    code=5,
+                ) from None
+            except json.JSONDecodeError:
+                raise Error(
+                    source="__get_cached_access_token",
+                    message="Invalid access token",
+                    code=5,
+                ) from None
+
+            exp = d_access_token.get("exp", None)
+            if exp is not None and exp < time.time():
+                raise Error(
+                    source="__get_cached_access_token",
+                    message="Access token expired",
+                    code=4,
+                )
+
+        return access_token
+
+    @logger(is_timed=False)
+    def __cache_access_token(self, email: str, access_token: str) -> None:
+        """Write an access token to cache
+
+        Args:
+            email (str): account email
+            access_token (str): account access token
+        """
+        email = email or "default"
+        cache = self.__read_cache()
+        if "access_tokens" not in cache:
+            cache["access_tokens"] = {}
+        cache["access_tokens"][email] = access_token
+        self.__write_cache(cache)
+
+    @logger(is_timed=False)
+    def __write_cache(self, info: dict):
+        """Write cache info to file
+
+        Args:
+            info (dict): cache info, current format
+            {
+                "access_tokens":{"someone@example.com": 'this account's access token', }
+            }
+        """
+        dirname = osp.dirname(self.cache_path) or "."
+        os.makedirs(dirname, exist_ok=True)
+        json.dump(info, open(self.cache_path, "w", encoding="utf-8"), indent=4)
+
+    @logger(is_timed=False)
+    def __read_cache(self):
+        try:
+            cached = json.load(open(self.cache_path, encoding="utf-8"))
+        except (FileNotFoundError, json.decoder.JSONDecodeError):
+            cached = {}
+        return cached
+
+    @logger(is_timed=True)
+    def __login(self):
+        if (
+            "email" not in self.config or "password" not in self.config
+        ) and "session_token" not in self.config:
+            log.error("Insufficient login details provided!")
+            raise Exception("Insufficient login details provided!")
+        auth = Authenticator(
+            email_address=self.config.get("email"),
+            password=self.config.get("password"),
+            proxy=self.config.get("proxy"),
+        )
+        if self.config.get("session_token"):
+            log.debug("Using session token")
+            auth.session_token = self.config["session_token"]
+            auth.get_access_token()
+            if auth.access_token is None:
+                del self.config["session_token"]
+                self.__login()
+                return
+        else:
+            log.debug("Using authenticator to get access token")
+            auth.begin()
+            self.config["session_token"] = auth.session_token
+            auth.get_access_token()
+
+        self.__set_access_token(auth.access_token)
+
+    @logger(is_timed=True)
+    def ask(
+        self,
+        prompt: str,
+        conversation_id: str | None = None,
+        parent_id: str | None = None,
+        timeout: float = 360,
+    ):
+        """Ask a question to the chatbot
+        Args:
+            prompt (str): The question
+            conversation_id (str | None, optional): UUID for the conversation to continue on. Defaults to None.
+            parent_id (str | None, optional): UUID for the message to continue on. Defaults to None.
+            timeout (float, optional): Timeout for getting the full response, unit is second. Defaults to 360.
+
+        Raises:
+            Error: _description_
+            Exception: _description_
+            Error: _description_
+            Error: _description_
+            Error: _description_
+
+        Yields:
+            _type_: _description_
+        """
+
+        if parent_id is not None and conversation_id is None:
+            log.error("conversation_id must be set once parent_id is set")
+            raise Error("User", "conversation_id must be set once parent_id is set", -1)
+
+        if conversation_id is not None and conversation_id != self.conversation_id:
+            log.debug("Updating to new conversation by setting parent_id to None")
+            self.parent_id = None
+
+        conversation_id = conversation_id or self.conversation_id
+        parent_id = parent_id or self.parent_id
+        if conversation_id is None and parent_id is None:
+            parent_id = str(uuid.uuid4())
+            log.debug("New conversation, setting parent_id to new UUID4: %s", parent_id)
+
+        if conversation_id is not None and parent_id is None:
+            if conversation_id not in self.conversation_mapping:
+                if self.lazy_loading:
+                    log.debug(
+                        "Conversation ID %s not found in conversation mapping, try to get conversation history for the given ID",
+                        conversation_id,
+                    )
+                    try:
+                        history = self.get_msg_history(conversation_id)
+                        self.conversation_mapping[conversation_id] = history[
+                            "current_node"
+                        ]
+                    except Exception:
+                        pass
+                else:
+                    log.debug(
+                        "Conversation ID %s not found in conversation mapping, mapping conversations",
+                        conversation_id,
+                    )
+
+                    self.__map_conversations()
+
+            if conversation_id in self.conversation_mapping:
+                log.debug(
+                    "Conversation ID %s found in conversation mapping, setting parent_id to %s",
+                    conversation_id,
+                    self.conversation_mapping[conversation_id],
+                )
+                parent_id = self.conversation_mapping[conversation_id]
+            else:  # invalid conversation_id provided, treat as a new conversation
+                conversation_id = None
+                parent_id = str(uuid.uuid4())
+        data = {
+            "action": "next",
+            "messages": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "role": "user",
+                    "content": {"content_type": "text", "parts": [prompt]},
+                },
+            ],
+            "conversation_id": conversation_id,
+            "parent_message_id": parent_id,
+            "model": "text-davinci-002-render-sha"
+            if not self.config.get("paid")
+            else "text-davinci-002-render-paid",
+        }
+        log.debug("Sending the payload")
+        log.debug(json.dumps(data, indent=2))
+
+        self.conversation_id_prev_queue.append(
+            data["conversation_id"],
+        )
+        self.parent_id_prev_queue.append(data["parent_message_id"])
+        response = self.session.post(
+            url=BASE_URL + "api/conversation",
+            data=json.dumps(data),
+            timeout=timeout,
+            stream=True,
+        )
+        self.__check_response(response)
+        for line in response.iter_lines():
+            line = str(line)[2:-1]
+            if line == "Internal Server Error":
+                log.error("Internal Server Error: %s", line)
+                raise Exception("Error: " + str(line))
+            if line == "" or line is None:
+                continue
+            if "data: " in line:
+                line = line[6:]
+            if line == "[DONE]":
+                break
+
+            line = line.replace('\\"', '"')
+            line = line.replace("\\'", "'")
+            line = line.replace("\\\\", "\\")
+
+            try:
+                line = json.loads(line)
+            except json.decoder.JSONDecodeError:
+                continue
+            if not self.__check_fields(line):
+                log.error("Field missing", exc_info=True)
+                if (
+                    line.get("detail")
+                    == "Too many requests in 1 hour. Try again later."
+                ):
+                    log.error("Rate limit exceeded")
+                    raise Error(source="ask", message=line.get("detail"), code=2)
+                if line.get("detail", {}).get("code") == "invalid_api_key":
+                    log.error("Invalid access token")
+                    raise Error(
+                        source="ask",
+                        message=line.get("detail", {}).get("message"),
+                        code=3,
+                    )
+
+                raise Error(source="ask", message="Field missing", code=1)
+            message = line["message"]["content"]["parts"][0]
+            if message == prompt:
+                continue
+            conversation_id = line["conversation_id"]
+            parent_id = line["message"]["id"]
+            try:
+                model = line["message"]["metadata"]["model_slug"]
+            except KeyError:
+                model = None
+            log.debug("Received message: %s", message)
+            log.debug("Received conversation_id: %s", conversation_id)
+            log.debug("Received parent_id: %s", parent_id)
+            yield {
+                "message": message,
+                "conversation_id": conversation_id,
+                "parent_id": parent_id,
+                "model": model,
+            }
+        self.conversation_mapping[conversation_id] = parent_id
+        if parent_id is not None:
+            self.parent_id = parent_id
+        if conversation_id is not None:
+            self.conversation_id = conversation_id
+
+    @logger(is_timed=False)
+    def __check_fields(self, data: dict) -> bool:
+        try:
+            data["message"]["content"]
+        except TypeError:
+            return False
+        except KeyError:
+            return False
+        return True
+
+    @logger(is_timed=False)
+    def __check_response(self, response):
+        """Make sure response is success
+
+        Args:
+            response (_type_): _description_
+
+        Raises:
+            Error: _description_
+        """
+        if response.status_code != 200:
+            print(response.text)
+            raise Error("OpenAI", response.status_code, response.text)
+
+    @logger(is_timed=True)
+    def get_conversations(
+        self,
+        offset: int = 0,
+        limit: int = 20,
+        encoding: str | None = None,
+    ):
+        """
+        Get conversations
+        :param offset: Integer
+        :param limit: Integer
+        """
+        url = BASE_URL + f"api/conversations?offset={offset}&limit={limit}"
+        response = self.session.get(url)
+        self.__check_response(response)
+        if encoding is not None:
+            response.encoding = encoding
+        data = json.loads(response.text)
+        return data["items"]
+
+    @logger(is_timed=True)
+    def get_msg_history(self, convo_id: str, encoding: str | None = None):
+        """
+        Get message history
+        :param id: UUID of conversation
+        :param encoding: String
+        """
+        url = BASE_URL + f"api/conversation/{convo_id}"
+        response = self.session.get(url)
+        self.__check_response(response)
+        if encoding is not None:
+            response.encoding = encoding
+        data = json.loads(response.text)
+        return data
+
+    @logger(is_timed=True)
+    def gen_title(self, convo_id: str, message_id: str):
+        """
+        Generate title for conversation
+        """
+        response = self.session.post(
+            BASE_URL + f"api/conversation/gen_title/{convo_id}",
+            data=json.dumps(
+                {"message_id": message_id, "model": "text-davinci-002-render"},
+            ),
+        )
+        self.__check_response(response)
+
+    @logger(is_timed=True)
+    def change_title(self, convo_id: str, title: str):
+        """
+        Change title of conversation
+        :param id: UUID of conversation
+        :param title: String
+        """
+        url = BASE_URL + f"api/conversation/{convo_id}"
+        response = self.session.patch(url, data=json.dumps({"title": title}))
+        self.__check_response(response)
+
+    @logger(is_timed=True)
+    def delete_conversation(self, convo_id: str):
+        """
+        Delete conversation
+        :param id: UUID of conversation
+        """
+        url = BASE_URL + f"api/conversation/{convo_id}"
+        response = self.session.patch(url, data='{"is_visible": false}')
+        self.__check_response(response)
+
+    @logger(is_timed=True)
+    def clear_conversations(self):
+        """
+        Delete all conversations
+        """
+        url = BASE_URL + "api/conversations"
+        response = self.session.patch(url, data='{"is_visible": false}')
+        self.__check_response(response)
+
+    @logger(is_timed=False)
+    def __map_conversations(self):
+        conversations = self.get_conversations()
+        histories = [self.get_msg_history(x["id"]) for x in conversations]
+        for x, y in zip(conversations, histories):
+            self.conversation_mapping[x["id"]] = y["current_node"]
+
+    @logger(is_timed=False)
+    def reset_chat(self) -> None:
+        """
+        Reset the conversation ID and parent ID.
+
+        :return: None
+        """
+        self.conversation_id = None
+        self.parent_id = str(uuid.uuid4())
+
+    @logger(is_timed=False)
+    def rollback_conversation(self, num: int = 1) -> None:
+        """
+        Rollback the conversation.
+        :param num: Integer. The number of messages to rollback
+        :return: None
+        """
+        for _ in range(num):
+            self.conversation_id = self.conversation_id_prev_queue.pop()
+            self.parent_id = self.parent_id_prev_queue.pop()
+
+
+class AsyncChatbot(Chatbot):
+    """
+    Async Chatbot class for ChatGPT
+    """
+
+    def __init__(
+        self,
+        config,
+        conversation_id=None,
+        parent_id=None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            conversation_id=conversation_id,
+            parent_id=parent_id,
+            session_client=AsyncClient,
+        )
+
+    async def ask(
+        self,
+        prompt,
+        conversation_id=None,
+        parent_id=None,
+        timeout=360,
+    ):
+        """
+        Ask a question to the chatbot
+        """
+        if parent_id is not None and conversation_id is None:
+            raise Error("User", "conversation_id must be set once parent_id is set", 1)
+
+        if conversation_id is not None and conversation_id != self.conversation_id:
+            self.parent_id = None
+
+        conversation_id = conversation_id or self.conversation_id
+        parent_id = parent_id or self.parent_id
+        if conversation_id is None and parent_id is None:
+            parent_id = str(uuid.uuid4())
+
+        if conversation_id is not None and parent_id is None:
+            if conversation_id not in self.conversation_mapping:
+                await self.__map_conversations()
+            parent_id = self.conversation_mapping[conversation_id]
+        data = {
+            "action": "next",
+            "messages": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "role": "user",
+                    "content": {"content_type": "text", "parts": [prompt]},
+                },
+            ],
+            "conversation_id": conversation_id,
+            "parent_message_id": parent_id,
+            "model": "text-davinci-002-render-sha"
+            if not self.config.get("paid")
+            else "text-davinci-002-render-paid",
+        }
+
+        self.conversation_id_prev_queue.append(
+            data["conversation_id"],
+        )
+        self.parent_id_prev_queue.append(data["parent_message_id"])
+
+        async with self.session.stream(
+            method="POST",
+            url=BASE_URL + "api/conversation",
+            data=json.dumps(data),
+            timeout=timeout,
+        ) as response:
+            self.__check_response(response)
+            async for line in response.aiter_lines():
+                if line == "" or line is None:
+                    continue
+                if "data: " in line:
+                    line = line[6:]
+                if "[DONE]" in line:
+                    break
+
+                try:
+                    line = json.loads(line)
+                except json.decoder.JSONDecodeError:
+                    continue
+                if not self.__check_fields(line):
+                    raise Exception("Field missing. Details: " + str(line))
+
+                message = line["message"]["content"]["parts"][0]
+                conversation_id = line["conversation_id"]
+                parent_id = line["message"]["id"]
+                model = (
+                    line["message"]["metadata"]["model_slug"]
+                    if "model_slug" in line["message"]["metadata"]
+                    else None
+                )
+                yield {
+                    "message": message,
+                    "conversation_id": conversation_id,
+                    "parent_id": parent_id,
+                    "model": model,
+                }
+            self.conversation_mapping[conversation_id] = parent_id
+            if parent_id is not None:
+                self.parent_id = parent_id
+            if conversation_id is not None:
+                self.conversation_id = conversation_id
+
+    async def get_conversations(self, offset=0, limit=20):
+        """
+        Get conversations
+        :param offset: Integer
+        :param limit: Integer
+        """
+        url = BASE_URL + f"api/conversations?offset={offset}&limit={limit}"
+        response = await self.session.get(url)
+        self.__check_response(response)
+        data = json.loads(response.text)
+        return data["items"]
+
+    async def get_msg_history(self, convo_id, encoding="utf-8"):
+        """
+        Get message history
+        :param id: UUID of conversation
+        """
+        url = BASE_URL + f"api/conversation/{convo_id}"
+        response = await self.session.get(url)
+        if encoding is not None:
+            response.encoding = encoding
+            self.__check_response(response)
+            data = json.loads(response.text)
+            return data
+
+    async def gen_title(self, convo_id, message_id):
+        """
+        Generate title for conversation
+        """
+        url = BASE_URL + f"api/conversation/gen_title/{convo_id}"
+        response = await self.session.post(
+            url,
+            data=json.dumps(
+                {"message_id": message_id, "model": "text-davinci-002-render"},
+            ),
+        )
+        await self.__check_response(response)
+
+    async def change_title(self, convo_id, title):
+        """
+        Change title of conversation
+        :param convo_id: UUID of conversation
+        :param title: String
+        """
+        url = BASE_URL + f"api/conversation/{convo_id}"
+        response = await self.session.patch(url, data=f'{{"title": "{title}"}}')
+        self.__check_response(response)
+
+    async def delete_conversation(self, convo_id):
+        """
+        Delete conversation
+        :param convo_id: UUID of conversation
+        """
+        url = BASE_URL + f"api/conversation/{convo_id}"
+        response = await self.session.patch(url, data='{"is_visible": false}')
+        self.__check_response(response)
+
+    async def clear_conversations(self):
+        """
+        Delete all conversations
+        """
+        url = BASE_URL + "api/conversations"
+        response = await self.session.patch(url, data='{"is_visible": false}')
+        self.__check_response(response)
+
+    async def __map_conversations(self):
+        conversations = await self.get_conversations()
+        histories = [await self.get_msg_history(x["id"]) for x in conversations]
+        for x, y in zip(conversations, histories):
+            self.conversation_mapping[x["id"]] = y["current_node"]
+
+    def __check_fields(self, data: dict) -> bool:
+        try:
+            data["message"]["content"]
+        except TypeError:
+            return False
+        except KeyError:
+            return False
+        return True
+
+    def __check_response(self, response):
+        response.raise_for_status()
+
+
+get_input = logger(is_timed=False)(get_input)
+
+
+@logger(is_timed=False)
+def configure():
+    """
+    Looks for a config file in the following locations:
+    """
+    config_files = ["config.json"]
+    xdg_config_home = getenv("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        config_files.append(f"{xdg_config_home}/revChatGPT/config.json")
+    user_home = getenv("HOME")
+    if user_home:
+        config_files.append(f"{user_home}/.config/revChatGPT/config.json")
+
+    config_file = next((f for f in config_files if osp.exists(f)), None)
+    if config_file:
+        with open(config_file, encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        print("No config file found.")
+        raise Exception("No config file found.")
+    return config
+
+with open("账号数据/chatzh1.json") as f1:
+    # 将文件内容转换为字典
+    data1 = json.load(f1)
+    # 获取账号列表
+    accounts = list(data1["access_tokens"].keys())
+def generate_response(prompt,num):
+    ChatGPT=data["ChatGPT"]
+    ChatGPT= int(ChatGPT)
+    if ChatGPT==0:
+        with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+            apilist1 = f1.readlines()
+            apilist1 = [title.strip() for title in apilist1]
+        with open("账号数据/apilist2.txt", "r", encoding="utf-8") as f2:
+            apilist2 = f2.readlines()
+            apilist2 = [title.strip() for title in apilist2]
+        api = apilist1[num]
+        openai.api_key = api
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt }],
+                max_tokens=2000,
+                n=1,
+                temperature=0.9,
+            )
+            time.sleep(2)
+        except:
+            print(f"主列表apilist1.txt：{api}失效")
+            with open("账号数据/失效账号.txt", "r", encoding="utf-8") as f:
+                shixiaozh = f.readlines()
+                shixiaozh = [title.strip() for title in shixiaozh]
+            if api not in shixiaozh:
+               with open("账号数据/失效账号.txt", "a", encoding='utf-8') as f:
+                f.write(api + "\n")
+            random.shuffle(apilist2)
+            # 遍历列表并打印每个元素
+            for index, element in enumerate(apilist2):
+                print((f"正在使用apilist2副列表的{element}"))
+                openai.api_key = element
+                try:
+
+                    response = openai.ChatCompletion.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": prompt }],
+                        max_tokens=2000,
+                        n=1,
+                        temperature=0.9,
+                    )
+                    time.sleep(2)
+                except:
+                    print(f"apilist2副列表{element}失效")
+                    if api not in shixiaozh:
+                        with open("账号数据/失效账号.txt", "a", encoding='utf-8') as f:
+                            f.write(api + "\n")
+                    continue
+                else:
+                    break
+            return response['choices'][0]['message']['content']
+        else:
+            return response['choices'][0]['message']['content']
+    elif ChatGPT == 1:
+            time.sleep(2)
+            email = accounts[num]
+            try:
+                chatbot = Chatbot(
+                    config={
+                        "email": email,
+                    },
+                )
+                print((f"列表账号{email}登录成功"))
+            except:
+                print((f"列表账号{email}登录失败"))
+                with open("账号数据/失效账号.txt", "r", encoding="utf-8") as f:
+                    shixiaozh = f.readlines()
+                    shixiaozh = [title.strip() for title in shixiaozh]
+                if email not in shixiaozh:
+                    with open("账号数据/失效账号.txt", "a", encoding='utf-8') as f:
+                        f.write(email + "\n")
+                with open("账号数据/chatzh2.json") as f2:
+                    # 将文件内容转换为字典
+                    data2 = json.load(f2)
+                    # 获取账号列表
+                    accountsby = list(data2["access_tokens"].keys())
+                    random.shuffle(accountsby)
+                    f2.close()
+                for index, element in enumerate(accountsby):
+                    print((f"正在登录副列表账号{element}"))
+                    email = element
+                    try:
+                        chatbot = Chatbot(
+                            config={
+                                "email": email,
+                            },
+                        )
+                        print((f"副列表账号{element}登录成功"))
+                    except:
+                        print(f"备用列表账号{element}失效")
+                        if email not in shixiaozh:
+                            with open("账号数据/失效账号.txt", "a", encoding='utf-8') as f:
+                                f.write(email + "\n")
+                        continue
+
+            def handle_commands(command: str) -> bool:
+                if command == "!help":
+                    print(
+                        """
+                    !help - Show this message
+                    !reset - Forget the current conversation
+                    !config - Show the current configuration
+                    !rollback x - Rollback the conversation (x being the number of messages to rollback)
+                    !exit - Exit this program
+                    !setconversation - Changes the conversation
+                    """,
+                    )
+                elif command == "!reset":
+                    chatbot.reset_chat()
+                    print("Chat session successfully reset.")
+                elif command == "!config":
+                    print(json.dumps(chatbot.config, indent=4))
+                elif command.startswith("!rollback"):
+                    try:
+                        rollback = int(command.split(" ")[1])
+                    except IndexError:
+                        logging.exception(
+                            "No number specified, rolling back 1 message",
+                            stack_info=True,
+                        )
+                        rollback = 1
+                    chatbot.rollback_conversation(rollback)
+                    print(f"Rolled back {rollback} messages.")
+                elif command.startswith("!setconversation"):
+                    try:
+                        chatbot.conversation_id = chatbot.config[
+                            "conversation_id"
+                        ] = command.split(" ")[1]
+                        print("Conversation has been changed")
+                    except IndexError:
+                        log.exception(
+                            "Please include conversation UUID in command",
+                            stack_info=True,
+                        )
+                        print("Please include conversation UUID in command")
+                elif command == "!exit":
+                    exit(0)
+                else:
+                    return False
+                return True
+
+            artical = " "
+            count = 0
+            artical1 = " "
+            while not artical1[-1] == "。" and not artical1[-1] == "." and not artical1[-1] == "?" and not artical1[
+                                                                                                              -1] == "？" and not \
+                    artical1[-1] == "！" and not artical1[-1] == "!":
+
+                if count == 0:
+                    if prompt.startswith("!"):
+                        if handle_commands(prompt):
+                            continue
+                    response = ""
+                    for data1 in chatbot.ask(
+                            prompt,
+                    ):
+                        response = data1["message"]
+                    artical = artical + response
+                    artical1 = artical.strip()
+                    count = count + 1
+                else:
+                    prompt = "继续"
+                    if prompt.startswith("!"):
+                        if handle_commands(prompt):
+                            continue
+                    response = ""
+                    prev_text = ""
+                    for data1 in chatbot.ask(
+                            prompt,
+                    ):
+                        response = data1["message"]
+                    artical = artical + response
+                    artical1 = artical.strip()
+                    count = count + 1
+            return artical
+    elif ChatGPT==2:
+        random_number1 = random.randint(20, 40)
+        artical = chat3(prompt)
+        time.sleep(random_number1)
+        return artical
+def chat3(prompt):
+    manaserc=data["manaserc"]
+    msg = prompt
+    msgcache = f"YOU:{msg}\n"
+    random_number = random.randint(1000, 9999)
+    random_number = str(random_number)
+    conversationid = "oieam4nUptH3tidA1dgqV5gjWhe0166784248"+random_number
+    openid = "oieam4p1H1IlaTwtBXfVW87g"+random_number
+    openid1 = openid.replace("_", "").replace("-", "")[-16:]
+    req = requests.post('https://apiplus-apiplus-tzkimvskde.cn-hangzhou.fcapp.run/plu',
+                        json={"msg": msg, "msgcache": msgcache, "conversationid": conversationid,
+                              "userid": openid1, "manaserc": manaserc[0]}, headers={
+            'content-type': 'application/json'})
+    reqdic = json.loads(req.text)
+    answ = reqdic['answ']
+    return answ
+def getcookie(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+
+    # Open new page
+    page = context.new_page()
+    page.goto("https://cuttlefish.baidu.com/ndecommtob/browse/index?_wkts_=1673788495774#/taskCenter/majorTask")
+    page.wait_for_timeout(10000)
+
+    try:
+        button = page.get_by_role("button", name="Close")
+        button.click()
+    except :
+        pass
+
+    page.get_by_role("main").get_by_text("互联网").click()
+
+    storage = context.storage_state()
+    with open("账号数据/cookie.json", "w") as f:
+        f.write(json.dumps(storage))
+
+    # Close page
+    page.close()
+
+    # ---------------------
+    context.close()
+    browser.close()
+
+
+
+
+def getKeyword(keyword):
+    url = 'https://www.baidu.com/sugrec'
+    params = {
+        'prod': 'pc',
+        'wd': keyword,
+    }
+    res = requests.get(url, params=params).json()
+    if res.get('g'):
+        keywords = [keyword['q'] for keyword in res['g']]
+        return keywords
+
+
+# 定义载入任务的函数
+def load_tasks():
+    all_titles = []  # 定义一个列表保存载入的所有标题数据
+    with open('output/tasks.csv', 'r', encoding='utf-8') as f:  # 打开tasks.csv文件，模式为只读，编码为utf-8
+        reader = csv.DictReader(f)  # 以字典的方式进行读取，返回的是一个迭代器
+        for item in reader:  # 遍历每一行数据
+            category = item['category']  # 获取标题的种类
+            all_titles.append((item['title'], item['page'], item['index']))
+    return all_titles, category  # 最后返回标题数据列表和标题种类
+
+
+# 定义生成docx文档的函数
+def generate_docx(title, artical, output_path):
+    Doc = Document()  # 生成doc对象
+    Doc.styles['Normal'].font.name = u'宋体'
+    Doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+    Doc.styles['Normal'].font.size = Pt(14)
+    Doc.styles['Normal'].font.color.rgb = RGBColor(0, 0, 0)
+    Head = Doc.add_heading("", level=1)  # 这里不填标题内容
+    run = Head.add_run(title)
+    run.font.size = Pt(16)
+    run.font.name = u'宋体'
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+    Doc.add_paragraph(artical)
+    Doc.save(output_path)  # 保存文件
+
+
+# 定义判断文章是否存在的函数
+def artical_is_exist(category, title):
+    return os.path.exists(f'output/articals/{category}/{title}.docx')
+
+
+
+def adddocx1(title, output_path):
+    Doc = docx.Document(output_path)
+    Doc.styles['Normal'].font.name = u'宋体'
+    Doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+    Doc.styles['Normal'].font.size = Pt(12)
+    Doc.styles['Normal'].font.color.rgb = RGBColor(0, 0, 0)
+    Head = Doc.add_heading("", level=1)  # 这里不填标题内容
+    run = Head.add_run(title)
+    run.font.size = Pt(18)
+    run.font.name = u'宋体'
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+    Doc.save(output_path)  # 保存文件
+
+def adddocx2(title, artical, output_path):
+    Doc = docx.Document(output_path)
+    Doc.styles['Normal'].font.name = u'宋体'
+    Doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+    Doc.styles['Normal'].font.size = Pt(12)
+    Doc.styles['Normal'].font.color.rgb = RGBColor(0, 0, 0)
+    Head = Doc.add_heading("", level=1)  # 这里不填标题内容
+    run = Head.add_run(title)
+    run.font.size = Pt(15)
+    run.font.name = u'宋体'
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+    Doc.add_paragraph(artical)
+    Doc.save(output_path)  # 保存文件
+
+
+def main0(xianchennum, api_key, apilist,minfont):
+
+    promotelist = data["promotelist"]
+    promotelist1 = promotelist[0]
+    promotelist2 = promotelist[1]
+    simlar_filter_en = True
+    xianchengallnum = len(apilist)
+    titles_list, category = load_tasks()  # 调用载入任务的函数获取所有的标题
+    with open("output/已上传文章.txt", "r", encoding="utf-8") as f:
+        uploaded_titles = f.readlines()
+        uploaded_titles = [title.strip() for title in uploaded_titles]
+    start_index = int(xianchennum / xianchengallnum * len(titles_list))
+    xianchennum1 = xianchennum + 1
+    end_index = int(xianchennum1 / xianchengallnum * len(titles_list))
+    print(f'线程{xianchennum}从第{start_index}个任务开始，第{end_index}个任务结束')
+    for num, (title, page, index) in enumerate(titles_list[start_index + 1:end_index]):
+        if len(open('output/已上传文章.txt', encoding="utf-8").readlines()) >= 100:
+            break
+        else:
+            if artical_is_exist(category, title):  # 如果文章已经存在，则忽略
+                print(f"第{num + 1}个任务已完成，'{title}'文章已存在")
+                continue
+            if title in uploaded_titles:
+                print(f"第{num + 1}个任务已完成，'{title}'文章已存在")
+                continue
+            try :
+                promote1 = f"{promotelist1}"+r"\n\nHuman:" + f"写“{title}”{promotelist2}" + r"\nAI: "
+                artical = generate_response(promote1,xianchennum)  # 调用函数生成文章
+                time.sleep(2)
+            except:
+                print(f'第{xianchennum1}个api无效')
+
+            if simlar_filter_en == True and not high_similarity_filter(artical, title):
+                continue  # 分析重复度
+            while len(artical) < minfont or not artical[-1] == "。":
+                chat_log = f"{promotelist1}"+r"\n\nHuman:" + f"写“{title}”{promotelist2}" + r"\nAI: " + artical + r"\nHuman: 请继续回答，再补充一点" + r"\nAI: "
+                artical = artical + generate_response(chat_log,xianchennum)
+                time.sleep(2)
+                print(f"关于'{title}'的文章字数过少或不完整，已扩充")
+            output_path = f'output/articals/{category}/{title}.docx'
+            generate_docx(title, artical, output_path)
+            with open("output/已上传文章.txt", "a", encoding='utf-8') as f:
+                f.write(title + "\n")
+            # 调用函数生成docx文档
+            # with sync_playwright() as playwright:
+            #     多线程运行.run(playwright, category, page, index, title)
+            print(f"关于'{title}'的文章由线程{xianchennum1}生成成功")  # 输出提示信息
+
+
+def main1(xianchennum, api_key, apilist,minfont):
+
+    promotelist = data["promotelist"]
+    promotelist1 = promotelist[0]
+    promotelist2 = promotelist[1]
+    simlar_filter_en = True
+    xianchengallnum = len(apilist)
+    titles_list, category = load_tasks()  # 调用载入任务的函数获取所有的标题
+    with open("output/已上传文章.txt", "r", encoding="utf-8") as f:
+        uploaded_titles = f.readlines()
+        uploaded_titles = [title.strip() for title in uploaded_titles]
+    start_index = int(xianchennum / xianchengallnum * len(titles_list))
+    xianchennum1 = xianchennum + 1
+    end_index = int(xianchennum1 / xianchengallnum * len(titles_list))
+    print(f'线程{xianchennum}从第{start_index}个任务开始，第{end_index}个任务结束')
+    for num, (title, page, index) in enumerate(titles_list[start_index + 1:end_index]):
+        if len(open('output/已上传文章.txt', encoding="utf-8").readlines()) >= 100:
+            break
+        else:
+            if artical_is_exist(category, title):  # 如果文章已经存在，则忽略
+                print(f"第{num + 1}个任务已完成，'{title}'文章已存在")
+                continue
+            if title in uploaded_titles:
+                print(f"第{num + 1}个任务已完成，'{title}'文章已存在")
+                continue
+            line = title.strip()
+            try:
+                promot2 = promotelist[2] + line + promotelist[3]
+                ai_text1 = generate_response(promot2,xianchennum)
+            except:
+                print(f'第{num + 1}个api无效')
+                break
+            else:
+                output_path = f'output/articals/{category}/{title}.docx'
+                print(f'线程{num + 1}正在写入文档 "{title}"')
+                promot3 = promotelist[4] + line + promotelist[5]
+                ai_text2 = generate_response(promot3,xianchennum)
+                generate_docx(line, ai_text2, output_path)
+                artical = f"{line}" + ai_text2
+                lines1 = ai_text1.splitlines()
+                list1 = [line1 for line1 in lines1 if line1.strip() != '' and len(line1.strip()) > 1]
+                list1 = [line2.split('：')[0] for line2 in list1 if line2.strip() != '']
+                for num1, title1 in enumerate(list1):
+                    if len(artical) > minfont:
+                        break
+                    if "文章大纲" in title1 or "大纲" in title1:
+                        continue
+                    if "一、" in title1 or "二、" in title1 or "三、" in title1 or "四、" in title1 or "五、" in title1 or "六、" in title1 or "I." in title1 or "II." in title1 or "III" in title1 or "IV." in title1 or "Ⅴ." in title1 or "Ⅰ." in title1 or "Ⅱ." in title1 or "Ⅲ" in title1 or "Ⅳ" in title1 and not num1 == len(
+                            list1) - 1:
+                        artical = artical + "\n" + title1
+                        adddocx1(title1, output_path)
+                        continue
+                    promot4 = promotelist[6] + line + promotelist[7] + title1 + promotelist[8]
+                    ai_text3 = generate_response(promot4,xianchennum)
+                    adddocx2(title1, ai_text3, output_path)
+                    artical = artical + "\n" + title1 + ai_text3
+                print(f'线程{num + 1}写入文档 "{title}"成功')
+
+            with open("output/已上传文章.txt", "a", encoding='utf-8') as f:
+                f.write(title + "\n")
+            print(f"关于'{title}'的文章由线程{xianchennum1}生成成功")  # 输出提示信息
+def mainpt(xianchennum,xianchengallnum):
+
+    promotelist = data["promotelist"]
+    promotelist1 = promotelist[0]
+    promotelist2 = promotelist[1]
+    simlar_filter_en = True
+
+    titles_list, category = load_tasks()  # 调用载入任务的函数获取所有的标题
+    with open("output/已上传文章.txt", "r", encoding="utf-8") as f:
+        uploaded_titles = f.readlines()
+        uploaded_titles = [title.strip() for title in uploaded_titles]
+    start_index = int(xianchennum / xianchengallnum * len(titles_list))
+    xianchennum1 = xianchennum + 1
+    end_index = int(xianchennum1 / xianchengallnum * len(titles_list))
+    print(f'线程{xianchennum}从第{start_index}个任务开始，第{end_index}个任务结束')
+    for num, (title, page, index) in enumerate(titles_list[start_index + 1:end_index]):
+        if len(open('output/已上传文章.txt', encoding="utf-8").readlines()) >= 100:
+            break
+        else:
+            if artical_is_exist(category, title):  # 如果文章已经存在，则忽略
+                print(f"第{num + 1}个任务已完成，'{title}'文章已存在")
+                continue
+            if title in uploaded_titles:
+                print(f"第{num + 1}个任务已完成，'{title}'文章已存在")
+                continue
+            line = title.strip()
+            try:
+                promot2 = promotelist[9] + line + promotelist[10]
+                ai_text1 = generate_response(promot2,xianchennum)
+            except:
+                print(f'第{num + 1}个api无效')
+                break
+            else:
+                output_path = f'output/articals/{category}/{title}.docx'
+                print(f'线程{num + 1}正在写入文档 "{title}"')
+                generate_docx(line, ai_text1,output_path)
+                print(f'线程{num + 1}写入文档 "{title}"成功')
+            with open("output/已上传文章.txt", "a", encoding='utf-8') as f:
+                f.write(title + "\n")
+            print(f"关于'{title}'的文章由线程{xianchennum1}生成成功")  # 输出提示信息
+
+# 定义一个提示用户输入要爬取的种类的函数
+def select_category(cid1, all_category):
+    cid = str(cid1)
+    category = all_category[cid]
+
+    return cid, category
+
+
+# 定义解析curl的函数
+def analysis_curl(zhanghao):
+    temp_list = []  # 这个列表用于保存未处理的数据
+    headers = {}  # 这个字典用于保存最后输出的数据
+
+    # 打开curl.txt文件，mode='r'表示读取方式为“只读”，encoding='utf-8'表示编码方式为utf-8
+    with open(f"账号数据/curl{zhanghao}.txt", mode='r', encoding='utf-8') as f:
+        for line in f:  # 遍历crul文件中的每一行
+            line = line.strip()  # 移除字符串头尾指定的字符（默认为空格或换行符）
+
+            if line.startswith('-H'):  # 如果某一行是以-H开头的，那么这一行就是我们要找的参数，把它添加进列表中
+                temp_list.append(line)  # 把以-H开头的数据添加进列表中
+
+        for i in temp_list:  # 遍历列表中的每一项数据，对数据进行处理
+            data = i[4:-3]  # 去除行首的-H和行尾的\
+            split_index = data.find(':')  # 定义分隔符的下标
+            key = data[:split_index]  # 获取键
+            val = data[split_index + 2:]  # 获取值
+            headers[key] = val  # 把键和值组成字典
+
+    return headers  # 把headers字典返回
+
+
+# 检测生僻字
+def if_contain_chaos(keyword):
+    try:
+        keyword.encode("gb2312")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+# 判断字符串是否包含中文
+def str_contain_chinese(str):
+    for ch in str:
+        if u'\u4e00' <= ch <= u'\u9fff':
+            return True
+    return False
+
+
+def check_csv_empty():
+    with open('output/tasks.csv', 'r', encoding='utf-8') as file:
+        reader = csv.reader(file)
+        data = list(reader)
+        if len(data) == 1:
+            return 0
+        else:
+            return 1
+
+
+def gettitle(cid1, zhanghao, restricted_chars):
+    print(f'当前为账号{zhanghao}')
+    # 所有的种类用一个字典保存起来
+    all_category = {
+        "0": "学前教育",
+        "1": "基础教育",
+        "2": "高校与高等教育",
+        "3": "语言资格考试",
+        "4": "法律",
+        "5": "建筑",
+        "6": "互联网",
+        "7": "行业资料",
+        "8": "政务民生",
+        "9": "商品说明书",
+        "10": "实用模板",
+        "11": "生活娱乐",
+        "99": "推荐"
+    }
+
+    # 调用select_category函数获取用户选择爬取的种类
+    cid, category = select_category(cid1, all_category)
+
+    # 准备好要请求的url
+    url = "https://cuttlefish.baidu.com/user/interface/getquerypacklist"
+
+    # 解析curl
+    headers = analysis_curl(zhanghao)
+
+    # 准备爬取数据的参数
+    params = {
+        "cid": cid,
+        "pn": 0,
+        "rn": 20,
+        "word": "",
+        "tab": 1,
+    }
+    # 先进行一次爬取，以获取数据总数
+    time.sleep(random.randint(200, 500) / 100.0)
+    resp = requests.get(url, params=params, headers=headers)
+    if 'total' in resp.json()['data']:
+        time.sleep(random.randint(200, 500) / 100.0)  # sleep 200 ~ 500 ms
+        total_data = resp.json()['data']['total']
+        # 计算总页数
+        all_page = int(total_data) // 20
+
+        # 把数据写入到tasks.csv文件中
+        with open('output/tasks.csv', mode='w', encoding='utf-8') as f:  # 打开tasks.csv文件，模式为写入，编码为utf-8
+            print(f"爬取'{category}'类的标题数据")  # 输出提示信息
+            f.writelines("title,cid,category,page,estimated_price,status,index\n")  # 将表头数据写入tasks.csv
+            for page in range(all_page):  # 遍历每一页数据
+                print(f"正在抓取第{page + 1}页数据")  # 输出提示信息
+
+                # 定义要爬取的参数
+                params = {
+                    "cid": cid,
+                    "pn": page,
+                    "rn": 20,
+                    "word": "",
+                    "tab": 1,
+                }
+
+                resp = requests.get(url, params=params, headers=headers)  # 进行爬取
+                time.sleep(random.randint(200, 500) / 100.0)  # sleep 200 ~ 500 ms
+                datas = resp.json()['data']['queryList']  # 从返回的响应中提取我们要的数据
+                for index, data in enumerate(datas):
+
+                    jap = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7A3]')
+                    if data["status"] == 1 and all(char not in data['queryName'] for char in restricted_chars) \
+                            and not jap.search(data['queryName']) and not if_contain_chaos(data['queryName']) \
+                            and not len(data['queryName']) < 5 and '"' not in data['queryName'] \
+                            and ',' not in data['queryName'] and str_contain_chinese(data['queryName']) == True:
+                        f.writelines(
+                            f"{data['queryName']},{cid},{category},{page + 1},{data['estimatedPrice']},{data['status']},{index + 1}\n")  # 将数据写入tasks.csv文件中
+                    else:
+                        continue  # status == 2表示该任务已经完成，我们忽略
+        print(f"爬取'{category}'类完成，文件保存在output/tasks.csv")  # 最后输出提示信息提示爬取完成
+
+        # 删除失效文章
+        # 读取 tasks.csv 中的第一行数据
+        with open('output/tasks.csv', 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            try:
+                first_row = next(reader)
+                category = first_row['category']
+            except:
+                return 0
+
+
+        # 拼接文件夹路径
+        folder_path = f'output/articals/{category}'
+
+        # 读取 tasks.csv 中的所有行数据
+        with open('output/tasks.csv', 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            rows = [row for row in reader]
+
+        # 遍历文件夹下的所有文件
+        for file in os.listdir(folder_path):
+            # 获取文件名
+            file_name = os.path.splitext(file)[0]
+
+            # 判断文件名的长度
+            if len(file_name) < 5:
+                # 少于五个字的文件，删除
+                os.remove(os.path.join(folder_path, file))
+            else:
+                # 匹配文件名前五个字和 tasks.csv 中的每一行
+                matched = False
+                for row in rows:
+                    if row['title'][:5] == file_name[:5]:
+                        matched = True
+                        break
+
+                # 如果未匹配到，则删除文件
+                if not matched:
+                    os.remove(os.path.join(folder_path, file))
+                    print(f"{file_name}文章已上传，已自动删除")
+        check_csv_empty()
+        return check_csv_empty()
+    else:
+        return 0
+
+
+def cal_edit_distance(s1, s2):
+    # 初始化一个二维数组来存储距离值。
+    dp = [[0 for j in range(len(s2))] for i in range(len(s1))]
+
+    # 初始化第一行和第一列
+    for i in range(len(s1)):
+        dp[i][0] = i
+    for j in range(len(s2)):
+        dp[0][j] = j
+
+    # 填入阵列的其余部分
+    for i in range(1, len(s1)):
+        for j in range(1, len(s2)):
+            if s1[i] == s2[j]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                op1 = dp[i - 1][j] + 1
+                op2 = dp[i - 1][j - 1] + 1
+                op3 = dp[i][j - 1] + 1
+                dp[i][j] = min(op1, op2, op3)
+
+    # 返回两句子编辑距离
+    dis = dp[len(s1) - 1][len(s2) - 1]
+    return dis
+
+
+def high_similarity_filter(text, title):
+    # 将文本按照标点符号句子进行分割
+    sentences = re.split(r'[。，；、！？ \n]', text)
+    # 去除空字符串
+    sentences = [sentence for sentence in sentences if sentence != '']
+    # 计算句子之间的相似度
+    similarity_matrix = np.matrix(
+        [[cal_edit_distance(sentence1, sentence2) for sentence1 in sentences] for sentence2 in sentences])
+    # 计数矩阵里小于3的个数
+    count = np.sum(similarity_matrix < 3) - len(sentences)
+    ratio = (count / (len(sentences) ** 2))
+    print(
+        "《%s》，重复度太高，已跳过" % title if ratio >= 0.01 else "《%s》，重复度正常" % title if ratio < 0.01 else "《%s》，重复度正常" % title)
+    return ratio < 0.01  # True表示正常，False表示重复度太高
+
+
+def headless(openbrowser):
+    if openbrowser == 1:
+        return False  # False 为打开浏览器。True为不打开浏览器
+    else:
+        return True
+
+
+def run(playwright: Playwright, category, titlepage, index, title, zhanghao, openbrowser, closebutton) -> None:
+    browser = playwright.chromium.launch(headless=headless(openbrowser))  # headless=False
+    # 加载状态
+    with open(f"账号数据/cookie" + zhanghao + ".json") as f:
+        storage_state = json.loads(f.read())
+    context = browser.new_context(storage_state=storage_state)
+    # Open new page
+    page = context.new_page()
+    page.goto("https://cuttlefish.baidu.com/ndecommtob/browse/index?_wkts_=1673784226203#/taskCenter/majorTask")
+    # page.get_by_role("button", name="我知道啦").click()
+    # page.get_by_role("button", name="Close").click()
+    try :
+        button = page.get_by_role("button", name="Close")
+        button.click(timeout=1000)
+    except:
+        pass
+    if category == "推荐":
+            page.wait_for_timeout(1000)
+            index = int(index)
+            if titlepage == '1':
+                if index < 11:
+                    try:
+                        button = page.locator(f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.first.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").first.click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+
+                else:
+                    index = index - 10
+                    try:
+                        button = page.locator(f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+            elif int(titlepage) > 6:
+                page.locator(".el-pager > .el-icon").click()
+                page.locator(".el-pager > li:nth-child(8)").click()
+                page.get_by_role("listitem").filter(has_text=titlepage).click()
+                page.wait_for_timeout(6000)
+                if index < 11:
+                    try:
+                        button = page.locator(f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.first.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").first.click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+
+                else:
+                    index = index - 10
+                    try:
+                        button = page.locator(f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+            else:
+                page.get_by_role("listitem").filter(has_text=titlepage).click()
+                page.wait_for_timeout(1000)
+                if index < 11:
+                    try:
+                        button = page.locator(f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.first.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").first.click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+                else:
+                    index = index - 10
+                    try:
+                        button = page.locator(f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+            # Close page
+            page.close()
+            # ---------------------
+            context.close()
+            browser.close()
+    else:
+
+            page.wait_for_timeout(1000)
+            page.get_by_role("main").get_by_text(category).click()
+            page.wait_for_timeout(1000)
+            index = int(index)
+            if titlepage == '1':
+                if index < 11:
+                    try:
+                        button = page.locator(f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.first.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").first.click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+                else:
+                    index = index - 10
+                    try:
+                        button = page.locator(f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+            elif int(titlepage) > 6:
+                page.locator(".el-pager > .el-icon").click()
+                page.locator(".el-pager > li:nth-child(8)").click()
+                page.get_by_role("listitem").filter(has_text=titlepage).click()
+                page.wait_for_timeout(6000)
+                if index < 11:
+                    try:
+                        button = page.locator(f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.first.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").first.click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+                else:
+                    index = index - 10
+                    try:
+                        button = page.locator(f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+            else:
+                page.get_by_role("listitem").filter(has_text=titlepage).click()
+                page.wait_for_timeout(1000)
+                if index < 11:
+                    try:
+                        button = page.locator(f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.first.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").first.click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+                else:
+                    index = index - 10
+                    try:
+                        button = page.locator(f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button")
+                        button.click(timeout=1000)
+                    except:
+                        print(f"该文章已被他人上传")
+                    else:
+                        with page.expect_file_chooser() as fc_info:
+                            page.locator(
+                                f"div:nth-child(3) > div:nth-child({index}) > #upload-doc > .add-new-btn > .el-button").click()
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(
+                            f'output/articals/{category}/{title}.docx')
+                        page.wait_for_timeout(6000)
+                        page.get_by_role("button", name="确认提交").click()
+                        page.wait_for_timeout(1000)
+            # Close page
+            page.close()
+            # ---------------------
+            context.close()
+            browser.close()
+
+
+def upload(zhanghao, openbrowser, closebutton):
+    # 读取 tasks.csv 中的所有行数据
+    for i in range(3):
+        if sum(1 for line in open("output/已上传文章.txt", "r", encoding='utf-8')) >= 100:
+            break
+        try:
+            titles_list, category = load_tasks()  # 调用载入任务的函数获取所有的标题
+            folder_path = f'output/articals/{category}'
+            for file in os.listdir(folder_path):
+                # 获取文件名
+                if sum(1 for line in open("output/已上传文章.txt", "r", encoding='utf-8')) >= 100:
+                    break
+                file_name = os.path.splitext(file)[0]
+                # 判断文件名的长度
+                if len(file_name) < 5:
+                    # 少于五个字的文件，删除
+                    os.remove(os.path.join(folder_path, file))
+                else:
+                    # 匹配文件名前五个字和 tasks.csv 中的每一行
+                    matched = False
+                    for num, (title, page, index) in enumerate(titles_list):  # 遍历标题列表中的每一标题
+                        if title == file_name:
+                            matched = True
+                            with sync_playwright() as playwright:
+                                run(playwright, category, page, index, title, zhanghao, openbrowser, closebutton)
+                                os.remove(os.path.join(folder_path, file))
+                                print(f"'{file_name}'文章已上传，已自动删除")
+                                with open("output/已上传文章.txt", "a", encoding='utf-8') as f:
+                                    f.write(file_name + "\n")
+                                # 输出提示信息
+                            break
+                    # 如果未匹配到，则删除文件
+                    if not matched:
+                        os.remove(os.path.join(folder_path, file))
+                        print(f"{file_name}文章已上传，已自动删除")
+        except Exception as e:
+            print(e)
+            break
+        except KeyboardInterrupt:
+            # 当用户按下CTRL+C时，退出循环
+            break
+
+
+def _async_raise(tid, exctype):
+    """raises the exception, performs cleanup if needed"""
+
+    tid = ctypes.c_long(tid)
+
+    if not inspect.isclass(exctype):
+        exctype = type(exctype)
+
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, ctypes.py_object(exctype))
+
+    if res == 0:
+
+        raise ValueError("invalid thread id")
+
+    elif res != 1:
+
+        # """if it returns a number greater than one, you're in trouble,
+
+        # and you should call it again with exc=NULL to revert the effect"""
+
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, None)
+
+        raise SystemError("PyThreadState_SetAsyncExc failed")
+
+
+def stop_thread(thread):
+    _async_raise(thread.ident, SystemExit)
+
+
+def clear_uploaded_txt():
+    with open("output/已上传文章.txt", "w", encoding='utf-8') as f:
+        f.write("")
+
+
+
+
+def save_pickle():
+    filename = '账号数据/output.pickle'
+    update_data()
+    with open(filename, 'wb') as f:
+        pickle.dump(data, f)
+
+
+def load_pickle():
+    filename = '账号数据/output.pickle'
+    with open(filename, 'rb') as f:
+        global data
+        data = pickle.load(f)
+        display_data()
+
+
+def display_data():
+    global data
+    data_text.delete('1.0', tk.END)
+    for key, value in data.items():
+        data_text.insert(tk.END, '{}: {}\n'.format(key, value))
+
+
+def update_data():
+    global data
+    lines = data_text.get('1.0', tk.END).split('\n')
+    data = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        key, value = line.split(':', 1)
+        data[key.strip()] = eval(value.strip())
+    with open('账号数据/output.pickle', 'wb') as f:
+        pickle.dump(data, f)
+
+def uploadplay():
+
+    openbrowser = data['openbrowser']
+    closebutton = data['closebutton']
+    zhanghao = data['zhanghao']
+    cid = data['cid']
+    zhanghao = str(zhanghao)
+    upload(zhanghao, openbrowser, closebutton)
+def gettitleplay():
+
+
+    cidlist = data['cidlist']
+    zhanghaolist = data['zhanghaolist']
+    restricted_chars = data['restricted_chars']
+    max_count = data['max_count']
+    openbrowser = data['openbrowser']
+    closebutton = data['closebutton']
+    zhanghao = data['zhanghao']
+    cid = data['cid']
+    zhanghao = str(zhanghao)
+    gettitle(cid, zhanghao, restricted_chars)
+def getarticleplay():
+
+    cidlist = data['cidlist']
+    zhanghaolist = data['zhanghaolist']
+    restricted_chars = data['restricted_chars']
+    max_count = data['max_count']
+    openbrowser = data['openbrowser']
+    closebutton = data['closebutton']
+    zhanghao = data['zhanghao']
+    cid = data['cid']
+    minfont = data['minfont']
+    promotelist = data["promotelist"]
+    promotelist1 = promotelist[0]
+    promotelist2 = promotelist[1]
+    with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+        apilist1 = f1.readlines()
+        apilist = [title.strip() for title in apilist1]
+    thread = []
+    for num, title in enumerate(apilist):
+        k = threading.Thread(target=main0, args=(num, title, apilist,minfont))
+        thread.append(k)
+    for j in thread:
+        j.daemon = True
+        j.start()
+    time.sleep(60)
+    for t in thread:
+        t.join()
+
+
+def runplay(apilist, cidlist, zhanghaolist, restricted_chars, max_count, openbrowser, closebutton,minfont):
+    count = 0
+    while count < max_count:
+        for zhanghao in zhanghaolist:
+            clear_uploaded_txt()
+            time.sleep(1)
+            for cidnum in cidlist:
+                a = gettitle(cidnum, zhanghao, restricted_chars)
+                if a == 1:
+                    thread = []
+                    for num, title in enumerate(apilist):
+                        k = threading.Thread(target=main0, args=(num, title, apilist,minfont))
+                        thread.append(k)
+                    for j in thread:
+                        j.daemon = True
+                        j.start()
+                    time.sleep(60)
+                    for t in thread:
+                        t.join()
+                    upload(zhanghao, openbrowser, closebutton)
+                else:
+                    continue
+        count += 1
+def runplay1(apilist, cidlist, zhanghaolist, restricted_chars, max_count, openbrowser, closebutton,minfont):
+    count = 0
+    with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+        apilist1 = f1.readlines()
+        apilist1 = [title.strip() for title in apilist1]
+    minfont = data["minfont"]
+    ChatGPT=data["ChatGPT"]
+
+    ChatGPT=int(ChatGPT)
+    xianchengnum = len(apilist1)
+    if ChatGPT == 1:
+        xianchengnum = len(accounts)
+    elif ChatGPT==2:
+        xianchengnum = 1
+    with open("output/已生成文章.txt", "r", encoding="utf-8") as f:
+        uploaded_titles = f.readlines()
+        uploaded_titles = [title.strip() for title in uploaded_titles]
+    while count < max_count:
+        for zhanghao in zhanghaolist:
+            clear_uploaded_txt()
+            time.sleep(1)
+            for cidnum in cidlist:
+                a = gettitle(cidnum, zhanghao, restricted_chars)
+                if a == 1:
+                    thread = []
+                    for num, title in enumerate(apilist):
+                        k = threading.Thread(target=main1, args=(num, title, apilist,minfont))
+                        thread.append(k)
+                    for j in thread:
+                        j.daemon = True
+                        j.start()
+                    time.sleep(60)
+                    for t in thread:
+                        t.join()
+                    upload(zhanghao, openbrowser, closebutton)
+                else:
+                    continue
+        count += 1
+
+def runplay2(apilist, cidlist, zhanghaolist, restricted_chars, max_count, openbrowser, closebutton,minfont):
+    count = 0
+    with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+        apilist1 = f1.readlines()
+        apilist1 = [title.strip() for title in apilist1]
+    minfont = data["minfont"]
+    ChatGPT=data["ChatGPT"]
+
+    ChatGPT=int(ChatGPT)
+    xianchengnum = len(apilist1)
+    if ChatGPT == 1:
+        xianchengnum = len(accounts)
+    elif ChatGPT==2:
+        xianchengnum = 1
+    with open("output/已生成文章.txt", "r", encoding="utf-8") as f:
+        uploaded_titles = f.readlines()
+        uploaded_titles = [title.strip() for title in uploaded_titles]
+    while count < max_count:
+        for zhanghao in zhanghaolist:
+            clear_uploaded_txt()
+            time.sleep(1)
+            for cidnum in cidlist:
+
+                a = gettitle(cidnum, zhanghao, restricted_chars)
+                if a == 1:
+                    thread = []
+                    for num in range(xianchengnum):
+                        k = threading.Thread(target=mainpt, args=(num, xianchengnum))
+                        thread.append(k)
+                    for j in thread:
+                        j.daemon = True
+                        j.start()
+                    time.sleep(60)
+                    for t in thread:
+                        t.join()
+                    upload(zhanghao, openbrowser, closebutton)
+                else:
+                    continue
+        count += 1
+
+def run_list1():
+    load_pickle()
+    with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+        apilist1 = f1.readlines()
+        apilist = [title.strip() for title in apilist1]
+    cidlist = data['cidlist']
+    zhanghaolist = data['zhanghaolist']
+    restricted_chars = data['restricted_chars']
+    max_count = data['max_count']
+    openbrowser = data['openbrowser']
+    closebutton = data['closebutton']
+    minfont = data['minfont']
+
+    runplay(apilist, cidlist, zhanghaolist, restricted_chars, max_count, openbrowser, closebutton,minfont)
+def run_list2():
+    load_pickle()
+    with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+        apilist1 = f1.readlines()
+        apilist = [title.strip() for title in apilist1]
+    cidlist = data['cidlist']
+    zhanghaolist = data['zhanghaolist']
+    restricted_chars = data['restricted_chars']
+    max_count = data['max_count']
+    openbrowser = data['openbrowser']
+    closebutton = data['closebutton']
+    minfont = data['minfont']
+
+    runplay1(apilist, cidlist, zhanghaolist, restricted_chars, max_count, openbrowser, closebutton,minfont)
+def run_list3():
+    load_pickle()
+    with open("账号数据/apilist1.txt", "r", encoding="utf-8") as f1:
+        apilist1 = f1.readlines()
+        apilist = [title.strip() for title in apilist1]
+    cidlist = data['cidlist']
+    zhanghaolist = data['zhanghaolist']
+    restricted_chars = data['restricted_chars']
+    max_count = data['max_count']
+    openbrowser = data['openbrowser']
+    closebutton = data['closebutton']
+    minfont = data['minfont']
+    zhanghao = data['zhanghao']
+    cid = data['cid']
+    zhanghao = str(zhanghao)
+    upload(zhanghao, openbrowser, closebutton)
+    runplay2(apilist, cidlist, zhanghaolist, restricted_chars, max_count, openbrowser, closebutton,minfont)
+
+
+def getcookieplay():
+    with sync_playwright() as playwright:
+        getcookie(playwright)
+
+
+root = tk.Tk()
+root.title("脚本")
+
+getcookieplay_button = tk.Button(root, text="获取cookie", command=getcookieplay)
+getcookieplay_button.pack()
+
+
+
+data_text = tk.Text(root, height=40, width=60)
+data_text.pack()
+load_button = tk.Button(root, text="加载/展示配置", command=load_pickle)
+load_button.pack()
+update_button = tk.Button(root, text="修改/保存配置", command=update_data)
+update_button.pack()
+
+gettitle_button = tk.Button(root, text="获取标题", command=gettitleplay)
+gettitle_button.pack()
+
+getarticle_button = tk.Button(root, text="生成文章", command=getarticleplay)
+getarticle_button.pack()
+
+upload_button = tk.Button(root, text="一键上传", command=uploadplay)
+upload_button.pack()
+run_button1 = tk.Button(root, text="普通文章生成", command=run_list3)
+run_button1.pack()
+root.mainloop()
